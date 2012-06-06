@@ -1,0 +1,373 @@
+*-----------------
+创建文件
+-----------------*/
+int creat(char strname[14])
+{
+	int fi,inum,bnum;
+	fi=Fd_dirfile(strname);//查找该文件夹下是否有文件
+	if(fi!=-1)
+	{
+		printf("该文件夹下已有 %s 文件或文件夹\n",strname);
+		return 0;
+	}
+
+	fflush(stdin);//开始输入文件内容
+	char *buf;
+	int i,k;
+	i = 0;k=0;
+
+	buf = (char *)malloc(BLOCKSIZ*sizeof(char));
+	
+	printf("输入文件内容，以\"###\"结束:\n");
+	while(k!=3)
+	{
+		buf[i] = getchar();
+		if(buf[i] == '#')
+		{
+			k++;
+			if(k == 3)
+				break;
+		}
+		else
+			k=0;
+		i++;
+		if(i/BLOCKSIZ > 0)
+		{
+			buf = (char *)realloc(buf,BLOCKSIZ*(i/BLOCKSIZ+1));
+		}
+	}
+	buf[i-2]='\0';
+
+	printf("buf length %d\n",strlen(buf));
+
+	inum=ialloc();//申请inode空间
+	if(inum<=-1)
+	{
+		printf("inode 申请失败!\n");
+		return 0;
+	}
+
+	bnum=balloc(strlen(buf)/BLOCKSIZ+1);//申请block
+	if(bnum<=-1)
+	{
+		printf("block 申请失败!\n");
+		//释放申请成功的inode
+		di_bitmap[inum]=0;//inode位图置0 表示空闲
+		filsys.s_free_inodes_count++;
+		return 0;
+		}
+
+	inodetemp->di_ino=inum;//i节点标志
+	//printf("inum=%d\n",inum);
+	inodetemp->di_number=1;//关联一个文件
+	inodetemp->di_mode=DIMODE_FILE;//0为目录
+	inodetemp->di_uid=cur_user->p_uid;//用户id 第一个用户
+	inodetemp->di_gid=cur_user->p_gid;//组id 管理员组
+	inodetemp->di_size=strlen(buf);//
+	inodetemp->di_ctime=0;   /* Creation time */
+	inodetemp->di_mtime=0;   /* Modification time */
+	printf("cu=%d,cg=%d\n",	inodetemp->di_uid,inodetemp->di_gid);
+	for(i=0;i<(int)inodetemp->di_size/BLOCKSIZ+1;i++)
+	{
+		inodetemp->di_block[i]=bnum+i;
+	}
+	fseek(fd,DATASTART+BLOCKSIZ*bnum, SEEK_SET);//将新建的文件写入硬盘data区
+	fwrite(buf,BLOCKSIZ*(inodetemp->di_size/BLOCKSIZ+1), 1, fd);
+	
+	fseek(fd,DINODESTART+BLOCKSIZ*inum, SEEK_SET);//将新建的文件信息写入硬盘inode区
+	fwrite(inodetemp,BLOCKSIZ, 1, fd);
+	
+	dir_buf[cur_inode->di_number].d_ino=inum;//修改当前目录的结构
+	strcpy(dir_buf[cur_inode->di_number].d_name,strname);
+	
+	fseek(fd,DATASTART+BLOCKSIZ*cur_inode->di_block[0], SEEK_SET);//将当前目录信息写入文件的block区
+	fwrite(dir_buf,BLOCKSIZ, 1, fd);
+
+	cur_inode->di_number++;//当前目录关联文件数++
+	printf("当前目录文件数%d\n",cur_inode->di_number);
+
+	fseek(fd,DINODESTART+BLOCKSIZ*cur_inode->di_ino, SEEK_SET);//将当前目录信息写入文件的inode区
+	fwrite(cur_inode,sizeof(struct inode), 1, fd);
+
+	filsys.s_free_blocks_count--;
+	filsys.s_free_blocks_group[inodetemp->di_block[0]/GROUPNUM]--;
+	filsys.s_free_inodes_count--;
+	
+	
+	fseek(fd, BLOCKSIZ, SEEK_SET);//修改超级块 free block计数 free inode计数 和每组free block 计数
+	fwrite (&filsys,BLOCKSIZ, 1,fd);
+
+	fseek(fd, BLOCKSIZ*2, SEEK_SET);//在硬盘修改inode位图
+	fwrite (di_bitmap,BLOCKSIZ, 1,fd);
+	
+	fseek(fd, BLOCKSIZ*3, SEEK_SET);//在硬盘修改block位图
+	fwrite (bk_bitmap,BLOCKSIZ, 1,fd);
+	free(buf);
+	return 1;
+}
+
+void changeinode()//交换 cur_inode和inodetemp 指针
+{
+	struct inode *intemp;
+	intemp=cur_inode;
+	cur_inode=inodetemp;
+	inodetemp=intemp;
+}
+
+/*-----------------
+开辟一个空闲的i节点，返回i节点
+--------------------*/
+int ialloc()
+{
+	int i;
+	if(i_lock==1)//检测是否加锁
+	{
+		printf("inode位图区已锁!稍后再试!\n");
+		i_lock=0;//解锁
+		return -1;
+	}
+	i_lock=1;//将inode位图加锁	
+	if(filsys.s_free_inodes_count<=0)
+	{
+		printf("inode已满!申请失败\n");
+		i_lock=0;//inode位图解锁
+		return -1;
+	}
+
+
+	//在inode bitmap寻找空闲的inode
+	for(i=0;i<DINODENUM;i++)
+	{
+		if(di_bitmap[i]==0)
+		{
+		//	printf("已经找到空闲的inode %d\n",i);
+			di_bitmap[i]=1;//inode位图置1 表示已被占用
+			filsys.s_free_inodes_count--;
+			i_lock=0;//inode位图解锁
+			return i;
+			
+		}
+	}
+
+
+	i_lock=0;//inode位图解锁
+	return -1;
+	
+}
+
+
+/*----------------
+释放一个i节点
+-------------------*/
+void   ifree(struct inode*)
+{
+
+}
+
+
+/*-------------------------
+balloc
+/申请硬盘空间/
+------------------------*/
+int  balloc(int k)
+{
+	printf("%d",k);
+	int bnum,i,j,n,g;
+	if(b_lock==1)
+	{
+		printf("block位图区已锁!稍后重试!\n");
+		return -1;
+	}
+	b_lock=1;//加锁
+	n=BLKGRUPNUM;
+	if(filsys.s_free_blocks_count<=0)
+	{
+		printf("磁盘已满!申请失败\n");
+		b_lock=0;//解锁
+		return -1;
+	}
+
+	//在block bitmap寻找空闲的inode
+	for(i=0;i<GROUPNUM;i++)
+	{
+		if(filsys.s_free_blocks_group[i]<k)//先找到有空闲的block组
+		{
+			continue;
+		}
+		if(i>=GROUPNUM-1)
+		{
+			n=DATABLKNUM%BLKGRUPNUM;//最后那个数据块只有12块
+		}
+		g=0;
+		for(j=0;j<n;j++)
+		{	
+			if(bk_bitmap[i*GROUPNUM+j]==0)
+			{
+				bnum=i*GROUPNUM+j;
+				g++;
+			//	printf("已经找到空闲的block %d 它在第%d组\n",bnum,i);
+				
+				filsys.s_free_blocks_group[i]--;
+				if(g==k)//如果找到足够的空闲块
+				{
+					b_lock=0;//解锁
+					printf("已经找到空闲的block %d 它在第%d组\n",bnum,i);
+					
+					for(i=0;i<k;i++)
+					{
+						bk_bitmap[bnum-i]=1;
+					}
+				
+					return bnum-k+1;
+				
+				}
+			
+			}
+			else
+			{
+				g=0;
+			}
+		}
+	}
+
+	printf("error!没有找到足够多连续空闲的block!\n");
+	b_lock=0;//解锁
+	return -1;
+	
+}
+
+/*-------------------------
+balloc
+//释放硬盘空间
+------------------------*/
+void	bfree(int bnum)
+ {
+
+ }
+
+char* ReadFile(char strname[14])
+{
+	int fi;
+	fi=Fd_dirfile(strname);//查找该文件夹下是否有文件
+	if(fi!=-1)
+	{
+	//	printf("已找到 %s 文件\n",strname);
+	}
+	else
+	{
+		printf("找不到到 %s 文件\n",strname);
+		return NULL;
+	}
+	inodetemp=read_inode(fi);
+//	printf("cu=%d,cg=%d\n",	inodetemp->di_uid,inodetemp->di_gid);
+//	printf("cu=%d,cg=%d\n",	cur_user->p_uid,cur_user->p_gid);
+	if(!access())
+	{	
+			printf("您没有权限!\n");
+			return NULL;
+	}
+
+	if(inodetemp==NULL)
+	{
+		return NULL;
+	}
+	if((inodetemp->di_mode&DIMODE_FILE)!=DIMODE_FILE)
+	{
+		printf("%s不是一个文件!\n",strname);
+		return NULL;
+	}
+
+	char *buf;
+	buf = (char *)malloc(BLOCKSIZ*(inodetemp->di_size/BLOCKSIZ+1));
+	
+	fseek(fd, DATASTART+BLOCKSIZ*inodetemp->di_block[0], SEEK_SET);
+	fread (buf, BLOCKSIZ*(inodetemp->di_size/BLOCKSIZ+1),1,fd);
+
+	return buf;
+}
+
+int cdir(char strname[])
+{
+	int fi,inum,bnum;
+	fi=Fd_dirfile(strname);//查找该文件夹下是否有文件
+	if(fi!=-1)
+	{
+		printf("该文件夹下已有 %s 文件或文件夹\n",strname);
+		return 0;
+	}
+	
+	
+	inum=ialloc();//申请inode空间
+	if(inum<=-1)
+	{
+		printf("inode 申请失败!\n");
+		return 0;
+	}
+	
+	
+	bnum=balloc(1);//申请block
+	if(bnum<=-1)
+	{
+		printf("block 申请失败!\n");
+		//释放申请成功的inode
+		di_bitmap[inum]=0;//inode位图置0 表示空闲
+		filsys.s_free_inodes_count++;
+		return 0;
+	}
+	
+	inodetemp->di_ino=inum;//i节点标志
+	//printf("inum=%d\n",inum);
+	inodetemp->di_number=2;//关联一个文件
+	inodetemp->di_mode=DIMODE_DIR;//
+	inodetemp->di_uid=cur_user->p_uid;//用户id 
+	inodetemp->di_gid=cur_user->p_gid;//组id 
+	inodetemp->di_size=0;//
+	inodetemp->di_ctime=0;   /* Creation time */
+	inodetemp->di_mtime=0;   /* Modification time */
+	inodetemp->di_block[0]=bnum;//所占物理块号 后3块分别是 一级指针，二级指针，3级指针
+	
+	fseek(fd,DINODESTART+BLOCKSIZ*inum, SEEK_SET);//将新建的文件写入硬盘inode区
+	fwrite(inodetemp,BLOCKSIZ, 1, fd);
+	
+	struct direct buf[BLOCKSIZ / sizeof(struct direct)];
+
+	strcpy(buf[0].d_name,".");
+	buf[0].d_ino= inum;//当前目录的dinode号
+	strcpy(buf[1].d_name,"..");
+	buf[1].d_ino= cur_inode->di_ino;
+	
+	fseek(fd,DATASTART+BLOCKSIZ*bnum, SEEK_SET);//将新建的文件写入硬盘data区
+	fwrite(buf,BLOCKSIZ, 1, fd);
+
+	
+	dir_buf[cur_inode->di_number].d_ino=inum;//修改当前目录的结构
+	strcpy(dir_buf[cur_inode->di_number].d_name,strname);
+	
+	fseek(fd,DATASTART+BLOCKSIZ*cur_inode->di_block[0], SEEK_SET);//将当前目录信息写入文件的block区
+	fwrite(dir_buf,BLOCKSIZ, 1, fd);
+	
+	cur_inode->di_number++;//当前目录关联文件数++
+	printf("当前目录文件数%d\n",cur_inode->di_number);
+
+	
+	fseek(fd,DINODESTART+BLOCKSIZ*cur_inode->di_ino, SEEK_SET);//将当前目录信息写入文件的inode区
+	fwrite(cur_inode,sizeof(struct inode), 1, fd);
+
+	
+	filsys.s_free_blocks_count--;
+	filsys.s_free_blocks_group[inodetemp->di_block[0]/GROUPNUM]--;
+	filsys.s_free_inodes_count--;
+	
+	
+	fseek(fd, BLOCKSIZ, SEEK_SET);//修改超级块 free block计数 free inode计数 和每组free block 计数
+	fwrite (&filsys,BLOCKSIZ, 1,fd);
+	
+	fseek(fd, BLOCKSIZ*2, SEEK_SET);//在硬盘修改inode位图
+	fwrite (di_bitmap,BLOCKSIZ, 1,fd);
+	
+	fseek(fd, BLOCKSIZ*3, SEEK_SET);//在硬盘修改block位图
+	fwrite (bk_bitmap,BLOCKSIZ, 1,fd);
+
+	return 1;
+
+}

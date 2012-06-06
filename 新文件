@@ -1,0 +1,16 @@
+hp@ubuntu:~$ cd /home/hp/HITCS-30--FAT32-For-Linux0.11
+hp@ubuntu:~/HITCS-30--FAT32-For-Linux0.11$ git add .
+hp@ubuntu:~/HITCS-30--FAT32-For-Linux0.11$ git commit -m 'first commit'
+# On branch master
+# Your branch is ahead of 'origin/master' by 1 commit.
+#
+nothing to commit (working directory clean)
+hp@ubuntu:~/HITCS-30--FAT32-For-Linux0.11$ git push origin master
+Counting objects: 4, done.
+Delta compression using up to 2 threads.
+Compressing objects: 100% (3/3), done.
+Writing objects: 100% (3/3), 1.90 KiB, done.
+Total 3 (delta 0), reused 0 (delta 0)
+To git@github.com:huashengshuita/HITCS-30--FAT32-For-Linux0.11.git
+   b771429..dc213ab  master -> master
+
