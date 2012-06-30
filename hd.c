@@ -1,13 +1,14 @@
 /*************************************************************************//**
  *****************************************************************************
  * @file   hd.c
- * @brief  HD driver.
-
+ * @brief  Hard disk (winchester) driver.
+ * The `device nr' in this file means minor device nr.
  * 
  *****************************************************************************
  *****************************************************************************/
 
 #include "type.h"
+#include "stdio.h"
 #include "const.h"
 #include "protect.h"
 #include "string.h"
@@ -21,27 +22,39 @@
 
 
 PRIVATE void	init_hd			();
+PRIVATE void	hd_open			(int device);
+PRIVATE void	hd_close		(int device);
+PRIVATE void	hd_rdwt			(MESSAGE * p);
+PRIVATE void	hd_ioctl		(MESSAGE * p);
 PRIVATE void	hd_cmd_out		(struct hd_cmd* cmd);
+PRIVATE void	get_part_table		(int drive, int sect_nr, struct part_ent * entry);
+PRIVATE void	partition		(int device, int style);
+PRIVATE void	print_hdinfo		(struct hd_info * hdi);
 PRIVATE int	waitfor			(int mask, int val, int timeout);
 PRIVATE void	interrupt_wait		();
 PRIVATE	void	hd_identify		(int drive);
 PRIVATE void	print_identify_info	(u16* hdinfo);
 
-PRIVATE	u8	hd_status;
-PRIVATE	u8	hdbuf[SECTOR_SIZE * 2];
+PRIVATE	u8		hd_status;
+PRIVATE	u8		hdbuf[SECTOR_SIZE * 2];
+PRIVATE	struct hd_info	hd_info[1];
+
+#define	DRV_OF_DEV(dev) (dev <= MAX_PRIM ? \
+			 dev / NR_PRIM_PER_DRIVE : \
+			 (dev - MINOR_hd1a) / NR_SUB_PER_DRIVE)
 
 /*****************************************************************************
  *                                task_hd
  *****************************************************************************/
 /**
  * Main loop of HD driver.
- *
+ * 
  *****************************************************************************/
-PUBLIC void task_hd()//Ó²ÅÌÇı¶¯Ö÷Ñ­»·
+PUBLIC void task_hd()//ç¡¬ç›˜é©±åŠ¨ä¸»å¾ªç¯
 {
 	MESSAGE msg;
 
-	init_hd();//³õÊ¼»¯¹¤×÷
+	init_hd();//åˆå§‹åŒ–å·¥ä½œ
 
 	while (1) {
 		send_recv(RECEIVE, ANY, &msg);
@@ -49,8 +62,21 @@ PUBLIC void task_hd()//Ó²ÅÌÇı¶¯Ö÷Ñ­»·
 		int src = msg.source;
 
 		switch (msg.type) {
-		case DEV_OPEN://½ÓÊÕDEV_OPENÏûÏ¢
-			hd_identify(0);//»ñÈ¡²¢´òÓ¡²¿·ÖÓ²ÅÌ²ÎÊı
+		case DEV_OPEN:
+			hd_open(msg.DEVICE);
+			break;
+
+		case DEV_CLOSE:
+			hd_close(msg.DEVICE);
+			break;
+
+		case DEV_READ:
+		case DEV_WRITE:
+			hd_rdwt(&msg);
+			break;
+
+		case DEV_IOCTL:
+			hd_ioctl(&msg);
 			break;
 
 		default:
@@ -70,16 +96,278 @@ PUBLIC void task_hd()//Ó²ÅÌÇı¶¯Ö÷Ñ­»·
  * <Ring 1> Check hard drive, set IRQ handler, enable IRQ and initialize data
  *          structures.
  *****************************************************************************/
-PRIVATE void init_hd()//³õÊ¼»¯
+PRIVATE void init_hd()//åˆå§‹åŒ–
 {
+	int i;
+
 	/* Get the number of drives from the BIOS data area */
-	u8 * pNrDrives = (u8*)(0x475);//´ÓÎïÀíµØÖ·0X475»ñÈ¡Ó²ÅÌÊıÁ¿
+	u8 * pNrDrives = (u8*)(0x475);//ä»ç‰©ç†åœ°å€0X475è·å–ç¡¬ç›˜æ•°é‡
 	printl("NrDrives:%d.\n", *pNrDrives);
 	assert(*pNrDrives);
 
-	put_irq_handler(AT_WINI_IRQ, hd_handler);//Ö¸¶¨hd_handlerÎªÓ²ÅÌÖĞ¶Ï´¦Àí³ÌĞò£¬´ò¿ªÓ²ÅÌÖĞ¶Ï
+	put_irq_handler(AT_WINI_IRQ, hd_handler);//æŒ‡å®šhd_handlerä¸ºç¡¬ç›˜ä¸­æ–­å¤„ç†ç¨‹åºï¼Œæ‰“å¼€ç¡¬ç›˜ä¸­æ–­
 	enable_irq(CASCADE_IRQ);
 	enable_irq(AT_WINI_IRQ);
+
+	for (i = 0; i < (sizeof(hd_info) / sizeof(hd_info[0])); i++)
+		memset(&hd_info[i], 0, sizeof(hd_info[0]));
+	hd_info[0].open_cnt = 0;
+}
+
+/*****************************************************************************
+ *                                hd_open
+ *****************************************************************************/
+/**
+ * <Ring 1> This routine handles DEV_OPEN message. It identify the drive
+ * of the given device and read the partition table of the drive if it
+ * has not been read.
+ * 
+ * @param device The device to be opened.å‚æ•°ä¸ºæ¬¡è®¾å¤‡å·
+ *****************************************************************************/
+PRIVATE void hd_open(int device)
+{
+	int drive = DRV_OF_DEV(device);ç”±è®¾å¤‡æ¬¡è®¾å¤‡å·å¾—åˆ°é©±åŠ¨å™¨å·
+	assert(drive == 0);	/* åªæœ‰ä¸€ä¸ªç¡¬ç›˜ï¼Œé©±åŠ¨å™¨å·ä¸€å®šä¸º0*/
+
+	hd_identify(drive);
+
+	if (hd_info[drive].open_cnt++ == 0) {
+		partition(drive * (NR_PART_PER_DRIVE + 1), P_PRIMARY);
+		print_hdinfo(&hd_info[drive]);
+	}
+}
+
+/*****************************************************************************
+ *                                hd_close
+ *****************************************************************************/
+/**
+ * <Ring 1> This routine handles DEV_CLOSE message. 
+ * 
+ * @param device The device to be opened.
+ *****************************************************************************/
+PRIVATE void hd_close(int device)
+{
+	int drive = DRV_OF_DEV(device);
+	assert(drive == 0);	/* only one drive */
+
+	hd_info[drive].open_cnt--;
+}
+
+
+/*****************************************************************************
+ *                                hd_rdwt
+ *****************************************************************************/
+/**
+ * <Ring 1> This routine handles DEV_READ and DEV_WRITE message.
+ * 
+ * @param p Message ptr.
+ *****************************************************************************/
+PRIVATE void hd_rdwt(MESSAGE * p)//è¯»ç¡¬ç›˜æ‰‡åŒº
+{
+	int drive = DRV_OF_DEV(p->DEVICE);
+
+	u64 pos = p->POSITION;
+	assert((pos >> SECTOR_SIZE_SHIFT) < (1 << 31));
+
+	/**
+	 * We only allow to R/W from a SECTOR boundary:
+	 */
+	assert((pos & 0x1FF) == 0);
+
+	u32 sect_nr = (u32)(pos >> SECTOR_SIZE_SHIFT); /* pos / SECTOR_SIZE */
+	int logidx = (p->DEVICE - MINOR_hd1a) % NR_SUB_PER_DRIVE;
+	sect_nr += p->DEVICE < MAX_PRIM ?
+		hd_info[drive].primary[p->DEVICE].base :
+		hd_info[drive].logical[logidx].base;
+
+	struct hd_cmd cmd;
+	cmd.features	= 0;
+	cmd.count	= (p->CNT + SECTOR_SIZE - 1) / SECTOR_SIZE;
+	cmd.lba_low	= sect_nr & 0xFF;
+	cmd.lba_mid	= (sect_nr >>  8) & 0xFF;
+	cmd.lba_high	= (sect_nr >> 16) & 0xFF;
+	cmd.device	= MAKE_DEVICE_REG(1, drive, (sect_nr >> 24) & 0xF);
+	cmd.command	= (p->type == DEV_READ) ? ATA_READ : ATA_WRITE;
+	hd_cmd_out(&cmd);
+
+	int bytes_left = p->CNT;
+	void * la = (void*)va2la(p->PROC_NR, p->BUF);
+
+	while (bytes_left) {
+		int bytes = min(SECTOR_SIZE, bytes_left);
+		if (p->type == DEV_READ) {
+			interrupt_wait();
+			port_read(REG_DATA, hdbuf, SECTOR_SIZE);
+			phys_copy(la, (void*)va2la(TASK_HD, hdbuf), bytes);
+		}
+		else {
+			if (!waitfor(STATUS_DRQ, STATUS_DRQ, HD_TIMEOUT))
+				panic("hd writing error.");
+
+			port_write(REG_DATA, la, bytes);
+			interrupt_wait();
+		}
+		bytes_left -= SECTOR_SIZE;
+		la += SECTOR_SIZE;
+	}
+}															
+
+
+/*****************************************************************************
+ *                                hd_ioctl
+ *****************************************************************************/
+/**
+ * <Ring 1> This routine handles the DEV_IOCTL message.
+ * 
+ * @param p  Ptr to the MESSAGE.
+ *****************************************************************************/
+PRIVATE void hd_ioctl(MESSAGE * p)
+{
+	int device = p->DEVICE;
+	int drive = DRV_OF_DEV(device);
+
+	struct hd_info * hdi = &hd_info[drive];
+
+	if (p->REQUEST == DIOCTL_GET_GEO) {
+		void * dst = va2la(p->PROC_NR, p->BUF);
+		void * src = va2la(TASK_HD,
+				   device < MAX_PRIM ?
+				   &hdi->primary[device] :
+				   &hdi->logical[(device - MINOR_hd1a) %
+						NR_SUB_PER_DRIVE]);
+
+		phys_copy(dst, src, sizeof(struct part_info));
+	}
+	else {
+		assert(0);
+	}
+}
+
+/*****************************************************************************
+ *                                get_part_table
+ *****************************************************************************/
+/**
+ * <Ring 1> Get a partition table of a drive.
+ * 
+ * @param drive   Drive nr (0 for the 1st disk, 1 for the 2nd, ...)n
+ * @param sect_nr The sector at which the partition table is located.
+ * @param entry   Ptr to part_ent struct.
+ *****************************************************************************/
+PRIVATE void get_part_table(int drive, int sect_nr, struct part_ent * entry)
+{
+	struct hd_cmd cmd;
+	cmd.features	= 0;
+	cmd.count	= 1;
+	cmd.lba_low	= sect_nr & 0xFF;
+	cmd.lba_mid	= (sect_nr >>  8) & 0xFF;
+	cmd.lba_high	= (sect_nr >> 16) & 0xFF;
+	cmd.device	= MAKE_DEVICE_REG(1, /* LBA mode*/
+					  drive,
+					  (sect_nr >> 24) & 0xF);
+	cmd.command	= ATA_READ;
+	hd_cmd_out(&cmd);
+	interrupt_wait();
+
+	port_read(REG_DATA, hdbuf, SECTOR_SIZE);
+	memcpy(entry,
+	       hdbuf + PARTITION_TABLE_OFFSET,
+	       sizeof(struct part_ent) * NR_PART_PER_DRIVE);
+}
+
+/*****************************************************************************
+ *                                partition
+ *****************************************************************************/
+/**
+ * <Ring 1> This routine is called when a device is opened. It reads the
+ * partition table(s) and fills the hd_info struct.
+ * 
+ * @param device Device nr.
+ * @param style  P_PRIMARY or P_EXTENDED.
+ *****************************************************************************/
+PRIVATE void partition(int device, int style)//è·å–ç¡¬ç›˜åˆ†åŒºè¡¨
+{
+	int i;
+	int drive = DRV_OF_DEV(device);
+	struct hd_info * hdi = &hd_info[drive];
+
+	struct part_ent part_tbl[NR_SUB_PER_DRIVE];
+
+	if (style == P_PRIMARY) {
+		get_part_table(drive, drive, part_tbl);
+
+		int nr_prim_parts = 0;
+		for (i = 0; i < NR_PART_PER_DRIVE; i++) { /* 0~3 */
+			if (part_tbl[i].sys_id == NO_PART) 
+				continue;
+
+			nr_prim_parts++;
+			int dev_nr = i + 1;		  /* 1~4 */
+			hdi->primary[dev_nr].base = part_tbl[i].start_sect;
+			hdi->primary[dev_nr].size = part_tbl[i].nr_sects;
+
+			if (part_tbl[i].sys_id == EXT_PART) /* extended */
+				partition(device + dev_nr, P_EXTENDED);
+		}
+		assert(nr_prim_parts != 0);
+	}
+	else if (style == P_EXTENDED) {
+		int j = device % NR_PRIM_PER_DRIVE; /* 1~4 */
+		int ext_start_sect = hdi->primary[j].base;
+		int s = ext_start_sect;
+		int nr_1st_sub = (j - 1) * NR_SUB_PER_PART; /* 0/16/32/48 */
+
+		for (i = 0; i < NR_SUB_PER_PART; i++) {
+			int dev_nr = nr_1st_sub + i;/* 0~15/16~31/32~47/48~63 */
+
+			get_part_table(drive, s, part_tbl);
+
+			hdi->logical[dev_nr].base = s + part_tbl[0].start_sect;
+			hdi->logical[dev_nr].size = part_tbl[0].nr_sects;
+
+			s = ext_start_sect + part_tbl[1].start_sect;
+
+			/* no more logical partitions
+			   in this extended partition */
+			if (part_tbl[1].sys_id == NO_PART)
+				break;
+		}
+	}
+	else {
+		assert(0);
+	}
+}
+
+/*****************************************************************************
+ *                                print_hdinfo
+ *****************************************************************************/
+/**
+ * <Ring 1> Print disk info.
+ * 
+ * @param hdi  Ptr to struct hd_info.
+ *****************************************************************************/
+PRIVATE void print_hdinfo(struct hd_info * hdi)//æ‰“å°åˆ†åŒºä¿¡æ¯
+{
+	int i;
+	for (i = 0; i < NR_PART_PER_DRIVE + 1; i++) {
+		printl("%sPART_%d: base %d(0x%x), size %d(0x%x) (in sector)\n",
+		       i == 0 ? " " : "     ",
+		       i,
+		       hdi->primary[i].base,
+		       hdi->primary[i].base,
+		       hdi->primary[i].size,
+		       hdi->primary[i].size);
+	}
+	for (i = 0; i < NR_SUB_PER_DRIVE; i++) {
+		if (hdi->logical[i].size == 0)
+			continue;
+		printl("         "
+		       "%d: base %d(0x%x), size %d(0x%x) (in sector)\n",
+		       i,
+		       hdi->logical[i].base,
+		       hdi->logical[i].base,
+		       hdi->logical[i].size,
+		       hdi->logical[i].size);
+	}
 }
 
 /*****************************************************************************
@@ -87,19 +375,26 @@ PRIVATE void init_hd()//³õÊ¼»¯
  *****************************************************************************/
 /**
  * <Ring 1> Get the disk information.
- *
+ * 
  * @param drive  Drive Nr.
  *****************************************************************************/
-PRIVATE void hd_identify(int drive)//»ñÈ¡Ó²ÅÌ²ÎÊıº¯Êı
+PRIVATE void hd_identify(int drive)//è·å–ç¡¬ç›˜å‚æ•°å‡½æ•°
 {
 	struct hd_cmd cmd;
-	cmd.device  = MAKE_DEVICE_REG(0, drive, 0);//MAKE_DEVICE_REGºÏ³ÉDEVICE¼Ä´æÆ÷£¬ÔÚinclude/hd.hÖĞ¶¨Òå
+	cmd.device  = MAKE_DEVICE_REG(0, drive, 0);//MAKE_DEVICE_REGåˆæˆDEVICEå¯„å­˜å™¨ï¼Œåœ¨include/hd.hä¸­å®šä¹‰
 	cmd.command = ATA_IDENTIFY;
-	hd_cmd_out(&cmd);//ÏòÓ²ÅÌ·¢ËÍÃüÁî
-	interrupt_wait();//µÈ´ıÖĞ¶Ï·¢Éú
-	port_read(REG_DATA, hdbuf, SECTOR_SIZE);//´ÓDATA¶Ë¿Ú»ñÈ¡Êı¾İ£¬µÃµ½Ó²ÅÌ²ÎÊı
+	hd_cmd_out(&cmd);//å‘ç¡¬ç›˜å‘é€å‘½ä»¤
+	interrupt_wait();//ç­‰å¾…ä¸­æ–­å‘ç”Ÿ
+	port_read(REG_DATA, hdbuf, SECTOR_SIZE);//ä»DATAç«¯å£è·å–æ•°æ®ï¼Œå¾—åˆ°ç¡¬ç›˜å‚æ•°
 
-	print_identify_info((u16*)hdbuf);
+
+	print_identify_info((u16*)hdbuf);//æ‰“å°ç¡¬ç›˜å‚æ•°
+
+	u16* hdinfo = (u16*)hdbuf;
+
+	hd_info[drive].primary[0].base = 0;//ä¸»åˆ†åŒºèµ·å§‹æ‰‡åŒº=0
+	/* Total Nr of User Addressable Sectors */
+	hd_info[drive].primary[0].size = ((int)hdinfo[61] << 16) + hdinfo[60];
 }
 
 /*****************************************************************************
@@ -107,10 +402,10 @@ PRIVATE void hd_identify(int drive)//»ñÈ¡Ó²ÅÌ²ÎÊıº¯Êı
  *****************************************************************************/
 /**
  * <Ring 1> Print the hdinfo retrieved via ATA_IDENTIFY command.
- *
+ * 
  * @param hdinfo  The buffer read from the disk i/o port.
  *****************************************************************************/
-PRIVATE void print_identify_info(u16* hdinfo)//²ÎÊı´òÓ¡
+PRIVATE void print_identify_info(u16* hdinfo)//å‚æ•°æ‰“å°
 {
 	int i, k;
 	char s[64];
@@ -119,8 +414,8 @@ PRIVATE void print_identify_info(u16* hdinfo)//²ÎÊı´òÓ¡
 		int idx;
 		int len;
 		char * desc;
-	} iinfo[] = {{10, 20, "HD SN"}, /* Serial number in ASCIIĞòÁĞºÅ */
-		     {27, 40, "HD Model"} /* Model number in ASCII ĞÍºÅ*/ };
+	} iinfo[] = {{10, 20, "HD SN"}, /* åºåˆ—å· in ASCII */
+		     {27, 40, "HD Model"} /*  å‹å· in ASCII */ };
 
 	for (k = 0; k < sizeof(iinfo)/sizeof(iinfo[0]); k++) {
 		char * p = (char*)&hdinfo[iinfo[k].idx];
@@ -132,15 +427,15 @@ PRIVATE void print_identify_info(u16* hdinfo)//²ÎÊı´òÓ¡
 		printl("%s: %s\n", iinfo[k].desc, s);
 	}
 
-	int capabilities = hdinfo[49];//¹¦ÄÜ£ºÖ§³ÖLBA£¨Âß¼­¿éÑ°Ö·£©·ñ£¿
+	int capabilities = hdinfo[49];//åŠŸèƒ½ï¼šæ”¯æŒLBAï¼ˆé€»è¾‘å—å¯»å€ï¼‰å¦ï¼Ÿ
 	printl("LBA supported: %s\n",
 	       (capabilities & 0x0200) ? "Yes" : "No");
 
-	int cmd_set_supported = hdinfo[83];//Ö§³ÖµÄÃüÁî¼¯
+	int cmd_set_supported = hdinfo[83];//æ”¯æŒçš„å‘½ä»¤é›†
 	printl("LBA48 supported: %s\n",
 	       (cmd_set_supported & 0x0400) ? "Yes" : "No");
 
-	int sectors = ((int)hdinfo[61] << 16) + hdinfo[60];//¿ÉÓÃ×î´óÉÈÇø
+	int sectors = ((int)hdinfo[61] << 16) + hdinfo[60];//å¯ç”¨æœ€å¤§æ‰‡åŒº
 	printl("HD size: %dMB\n", sectors * 512 / 1000000);
 }
 
@@ -149,21 +444,21 @@ PRIVATE void print_identify_info(u16* hdinfo)//²ÎÊı´òÓ¡
  *****************************************************************************/
 /**
  * <Ring 1> Output a command to HD controller.
- *
+ * 
  * @param cmd  The command struct ptr.
  *****************************************************************************/
-PRIVATE void hd_cmd_out(struct hd_cmd* cmd)//ÏòÓ²ÅÌÇı¶¯Æ÷·¢ËÍÃüÁî
+PRIVATE void hd_cmd_out(struct hd_cmd* cmd)//å‘ç¡¬ç›˜é©±åŠ¨å™¨å‘é€å‘½ä»¤
 {
 	/**
 	 * For all commands, the host must first check if BSY=1,
 	 * and should proceed no further unless and until BSY=0
 	 */
-	if (!waitfor(STATUS_BSY, 0, HD_TIMEOUT))//ÅĞ¶ÏStatus¼Ä´æÆ÷µÄBSYÎ»
+	if (!waitfor(STATUS_BSY, 0, HD_TIMEOUT))//åˆ¤æ–­Statuså¯„å­˜å™¨çš„BSYä½
 		panic("hd error.");
 
 	/* Activate the Interrupt Enable (nIEN) bit */
-	out_byte(REG_DEV_CTRL, 0);//Í¨¹ıDevice Control¼Ä´æÆ÷´ò¿ªÖĞ¶Ï
-	/* Load required parameters in the Command Block Registers ½«±ØÒª²ÎÊıĞ´Èë¼Ä´æÆ÷*/
+	out_byte(REG_DEV_CTRL, 0);//é€šè¿‡Device Controlå¯„å­˜å™¨æ‰“å¼€ä¸­æ–­
+	/* Load required parameters in the Command Block Registers */
 	out_byte(REG_FEATURES, cmd->features);
 	out_byte(REG_NSECTOR,  cmd->count);
 	out_byte(REG_LBA_LOW,  cmd->lba_low);
@@ -171,7 +466,7 @@ PRIVATE void hd_cmd_out(struct hd_cmd* cmd)//ÏòÓ²ÅÌÇı¶¯Æ÷·¢ËÍÃüÁî
 	out_byte(REG_LBA_HIGH, cmd->lba_high);
 	out_byte(REG_DEVICE,   cmd->device);
 	/* Write the command code to the Command Register */
-	out_byte(REG_CMD,     cmd->command);//Ò»µ©Ğ´Èëcommand¼Ä´æÆ÷£¬ÃüÁî¿ªÊ¼Ö´ĞĞ
+	out_byte(REG_CMD,     cmd->command);//ä¸€æ—¦å†™å…¥commandå¯„å­˜å™¨ï¼Œå‘½ä»¤å¼€å§‹æ‰§è¡Œ
 }
 
 /*****************************************************************************
@@ -179,12 +474,12 @@ PRIVATE void hd_cmd_out(struct hd_cmd* cmd)//ÏòÓ²ÅÌÇı¶¯Æ÷·¢ËÍÃüÁî
  *****************************************************************************/
 /**
  * <Ring 1> Wait until a disk interrupt occurs.
- *
+ * 
  *****************************************************************************/
-PRIVATE void interrupt_wait()//µÈ´ıÖĞ¶Ï
+PRIVATE void interrupt_wait()//ç­‰å¾…ä¸­æ–­
 {
 	MESSAGE msg;
-	send_recv(RECEIVE, INTERRUPT, &msg);//½ÓÊÕÏûÏ¢
+	send_recv(RECEIVE, INTERRUPT, &msg);//æ¥æ”¶æ¶ˆæ¯
 }
 
 /*****************************************************************************
@@ -192,11 +487,11 @@ PRIVATE void interrupt_wait()//µÈ´ıÖĞ¶Ï
  *****************************************************************************/
 /**
  * <Ring 1> Wait for a certain status.
- *
+ * 
  * @param mask    Status mask.
  * @param val     Required status.
  * @param timeout Timeout in milliseconds.
- *
+ * 
  * @return One if sucess, zero if timeout.
  *****************************************************************************/
 PRIVATE int waitfor(int mask, int val, int timeout)
@@ -214,11 +509,11 @@ PRIVATE int waitfor(int mask, int val, int timeout)
  *                                hd_handler
  *****************************************************************************/
 /**
- * <Ring 0ÄÚºË²¿·Ö> Interrupt handler.
- *
+ * <Ring 0> Interrupt handler.
+ * 
  * @param irq  IRQ nr of the disk interrupt.
  *****************************************************************************/
-PUBLIC void hd_handler(int irq)//ÖĞ¶Ï´¦Àí³ÌĞò
+PUBLIC void hd_handler(int irq)//ä¸­æ–­å¤„ç†ç¨‹åº
 {
 	/*
 	 * Interrupts are cleared when the host
@@ -226,7 +521,7 @@ PUBLIC void hd_handler(int irq)//ÖĞ¶Ï´¦Àí³ÌĞò
 	 *   - issues a reset, or
 	 *   - writes to the Command Register.
 	 */
-	hd_status = in_byte(REG_STATUS);//¶Ástatus¼Ä´æÆ÷»Ö¸´ÖĞ¶ÏÏìÓ¦
+	hd_status = in_byte(REG_STATUS);//è¯»statuså¯„å­˜å™¨æ¢å¤ä¸­æ–­å“åº”
 
-	inform_int(TASK_HD);//Í¨ÖªÇı¶¯³ÌĞò
+	inform_int(TASK_HD);//é€šçŸ¥é©±åŠ¨ç¨‹åº
 }
